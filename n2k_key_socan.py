@@ -3,6 +3,9 @@ from __future__ import annotations
 import select
 import socket
 import struct
+import subprocess
+import time
+from errno import ENOBUFS
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -29,6 +32,7 @@ HEARTBEAT_INTERVAL_MS = 1_000
 RECEIVE_POLL_INTERVAL_MS = 50
 FEEDBACK_LATCH_TIMEOUT_MS = 200
 DEFAULT_CAN_INTERFACE = "can0"
+DEFAULT_CAN_BITRATE = 250000
 CAN_EFF_FLAG = 0x80000000
 CAN_EFF_MASK = 0x1FFFFFFF
 
@@ -125,24 +129,47 @@ def source_from_nmea2000_id(frame_id: int) -> int:
 
 
 class SocketCANDevice:
-    """Small SocketCAN transport with the same send/receive shape used by the app."""
+    """Small SocketCAN transport with interface setup/teardown helpers."""
 
     _CAN_FRAME = struct.Struct("=IB3x8s")
 
-    def __init__(self, interface_name: str = DEFAULT_CAN_INTERFACE) -> None:
+    def __init__(self, interface_name: str = DEFAULT_CAN_INTERFACE, bitrate: int = DEFAULT_CAN_BITRATE) -> None:
         self.interface_name = interface_name
+        self.bitrate = bitrate
         self.socket: socket.socket | None = None
 
+    @staticmethod
+    def _run_cmd(cmd: list[str], check: bool = True) -> None:
+        result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if check and result.returncode != 0:
+            error = result.stderr.strip() or f"exit status {result.returncode}"
+            raise RuntimeError(f"Command {' '.join(cmd)!r} failed: {error}")
+
+    def _configure_interface(self) -> None:
+        # Reset + set bitrate then bring the SocketCAN network interface up.
+        # This prevents send failures such as "Network is down" when can0 exists
+        # but has not been configured by the OS yet.
+        self._run_cmd(["ip", "link", "set", self.interface_name, "down"], check=False)
+        self._run_cmd(
+            ["ip", "link", "set", self.interface_name, "type", "can", "bitrate", str(self.bitrate)],
+            check=False,
+        )
+        self._run_cmd(["ip", "link", "set", self.interface_name, "up"], check=True)
+
     def open(self) -> None:
+        self.close(set_down=False)
+        self._configure_interface()
         can_socket = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
         can_socket.bind((self.interface_name,))
         can_socket.setblocking(False)
         self.socket = can_socket
 
-    def close(self) -> None:
+    def close(self, set_down: bool = True) -> None:
         if self.socket is not None:
             self.socket.close()
             self.socket = None
+        if set_down:
+            self._run_cmd(["ip", "link", "set", self.interface_name, "down"], check=False)
 
     def send(self, frame_id: int, data: bytes) -> None:
         if self.socket is None:
@@ -150,7 +177,16 @@ class SocketCANDevice:
         payload = bytes(data[:8])
         can_id = (frame_id & CAN_EFF_MASK) | CAN_EFF_FLAG
         frame = self._CAN_FRAME.pack(can_id, len(payload), payload.ljust(8, b"\x00"))
-        self.socket.send(frame)
+        while True:
+            try:
+                self.socket.send(frame)
+                return
+            except OSError as exc:
+                if exc.errno != ENOBUFS and "No buffer space available" not in str(exc):
+                    raise
+                # With no ACKing peer on the bus, SocketCAN can report ENOBUFS.
+                # Keep retrying until the bus becomes ready again.
+                time.sleep(0.05)
 
     def receive(self, max_frames: int = 50, wait_time_ms: int = 0) -> list[tuple[int, bytes]]:
         if self.socket is None:
@@ -343,7 +379,7 @@ class BinarySwitchSimulatorApp:
         if self.is_connected:
             return
         try:
-            self.device = SocketCANDevice(DEFAULT_CAN_INTERFACE)
+            self.device = SocketCANDevice(DEFAULT_CAN_INTERFACE, DEFAULT_CAN_BITRATE)
             self.device.open()
             self.is_connected = True
             self.status_text.set("")
@@ -357,7 +393,10 @@ class BinarySwitchSimulatorApp:
             self.device = None
             self.is_connected = False
             self.status_text.set("")
-            messagebox.showerror("Connection error", f"Could not open SocketCAN interface {DEFAULT_CAN_INTERFACE}: {exc}")
+            messagebox.showerror(
+                "Connection error",
+                f"Could not open SocketCAN interface {DEFAULT_CAN_INTERFACE} @ {DEFAULT_CAN_BITRATE} bps: {exc}",
+            )
 
     def disconnect(self) -> None:
         self._stop_receive()
