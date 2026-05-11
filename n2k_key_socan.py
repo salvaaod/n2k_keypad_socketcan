@@ -4,18 +4,11 @@ import struct
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from nmea2000_simulator import (
-    GLOBAL_DESTINATION,
-    PGN_ADDRESS_CLAIM,
-    PGN_BINARY_SWITCH_BANK_STATUS,
-    PGN_HEARTBEAT,
-    PGN_PRODUCT_INFO,
-    build_address_claim,
-    build_heartbeat_payload,
-    nmea2000_id,
-    set_name_manufacturer_code,
-    split_fast_packet,
-)
+GLOBAL_DESTINATION = 0xFF
+PGN_ADDRESS_CLAIM = 60928
+PGN_HEARTBEAT = 126993
+PGN_PRODUCT_INFO = 126996
+PGN_BINARY_SWITCH_BANK_STATUS = 127501
 
 SWITCH_COUNT = 6
 PGN_BINARY_SWITCH_BANK_CONTROL = 127502
@@ -37,6 +30,43 @@ DEFAULT_CAN_INTERFACE = "can0"
 CAN_EFF_FLAG = 0x80000000
 CAN_EFF_MASK = 0x1FFFFFFF
 
+
+
+def build_address_claim(device_name: int) -> bytes:
+    return int(device_name & 0xFFFFFFFFFFFFFFFF).to_bytes(8, byteorder="little", signed=False)
+
+
+def build_heartbeat_payload(interval_ms: int, sequence: int) -> bytes:
+    interval = max(0, min(0xFFFF, int(interval_ms)))
+    return bytes((sequence & 0xFF,)) + interval.to_bytes(2, byteorder="little", signed=False) + bytes((0xFF,) * 5)
+
+
+def nmea2000_id(priority: int, pgn: int, source: int, destination: int = GLOBAL_DESTINATION) -> int:
+    priority_bits = (priority & 0x07) << 26
+    source_bits = source & 0xFF
+    pf = (pgn >> 8) & 0xFF
+    if pf < 240:
+        return priority_bits | ((pgn & 0x1FF00) << 8) | ((destination & 0xFF) << 8) | source_bits
+    return priority_bits | ((pgn & 0x1FFFF) << 8) | source_bits
+
+
+def set_name_manufacturer_code(device_name: int, manufacturer_code: int) -> int:
+    # NMEA 2000 NAME bits 21-31 hold the 11-bit manufacturer code.
+    manufacturer_mask = 0x7FF << 21
+    return (device_name & ~manufacturer_mask) | ((manufacturer_code & 0x7FF) << 21)
+
+
+def split_fast_packet(payload: bytes, sequence: int) -> list[bytes]:
+    sequence_id = (sequence & 0x07) << 5
+    payload_length = len(payload)
+    frames = [bytes((sequence_id, payload_length & 0xFF)) + payload[:6]]
+    remaining = payload[6:]
+    frame_number = 1
+    while remaining:
+        frames.append(bytes((sequence_id | (frame_number & 0x1F),)) + remaining[:7])
+        remaining = remaining[7:]
+        frame_number += 1
+    return frames
 
 
 def _ascii_field(value: str, length: int = 32) -> bytes:
