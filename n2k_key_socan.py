@@ -222,6 +222,9 @@ class BinarySwitchSimulatorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Azimut NMEA2000 Switch Simulator")
+        self._enter_fullscreen()
+        self.root.bind("<F11>", self._toggle_fullscreen)
+        self.root.bind("<Escape>", self._exit_fullscreen)
         self.device: SocketCANDevice | None = None
         self.receive_job: str | None = None
         self.address_claim_job: str | None = None
@@ -246,6 +249,15 @@ class BinarySwitchSimulatorApp:
         self._build_ui()
         self.root.after(100, self.connect)
 
+    def _enter_fullscreen(self, _event: tk.Event | None = None) -> None:
+        self.root.attributes("-fullscreen", True)
+
+    def _exit_fullscreen(self, _event: tk.Event | None = None) -> None:
+        self.root.attributes("-fullscreen", False)
+
+    def _toggle_fullscreen(self, _event: tk.Event | None = None) -> None:
+        self.root.attributes("-fullscreen", not bool(self.root.attributes("-fullscreen")))
+
     def _build_ui(self) -> None:
         self._build_menu()
         main = ttk.Frame(self.root, padding=12)
@@ -253,7 +265,9 @@ class BinarySwitchSimulatorApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         for column in range(3):
-            main.columnconfigure(column, weight=1)
+            main.columnconfigure(column, weight=1, uniform="switch_columns")
+        for row in range(2):
+            main.rowconfigure(row, weight=1, uniform="switch_rows")
 
         self.status_text = tk.StringVar(value="")
 
@@ -267,9 +281,9 @@ class BinarySwitchSimulatorApp:
                 bg="#d9d9d9",
                 activebackground="#c8c8c8",
                 relief="raised",
-                font=("TkDefaultFont", 11, "bold"),
+                font=("TkDefaultFont", 28, "bold"),
             )
-            button.grid(row=index // 3, column=index % 3, padx=5, pady=5, sticky="nsew")
+            button.grid(row=index // 3, column=index % 3, padx=8, pady=8, sticky="nsew")
             self.switch_buttons.append(button)
         self._refresh_switch_button_labels()
 
@@ -279,6 +293,8 @@ class BinarySwitchSimulatorApp:
         settings_menu.add_command(label="Node settings...", command=self.open_settings_dialog)
         settings_menu.add_separator()
         settings_menu.add_command(label="Retry connection", command=self.connect)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Toggle full screen", command=self._toggle_fullscreen)
         menu_bar.add_cascade(label="Settings", menu=settings_menu)
         self.root.config(menu=menu_bar)
 
