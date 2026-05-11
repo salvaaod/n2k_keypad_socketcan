@@ -1,22 +1,15 @@
-import os
-import platform
+import select
+import socket
+import struct
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from nmea2000_simulator import (
-    DEFAULT_CAN_INDEX,
-    DEFAULT_DEVICE_INDEX,
-    DEFAULT_DEVICE_TYPE,
-    DEFAULT_DLL_NAME,
     GLOBAL_DESTINATION,
     PGN_ADDRESS_CLAIM,
     PGN_BINARY_SWITCH_BANK_STATUS,
     PGN_HEARTBEAT,
     PGN_PRODUCT_INFO,
-    TIMING0_250K,
-    TIMING1_250K,
-    DeviceConfig,
-    USBCANDevice,
     build_address_claim,
     build_heartbeat_payload,
     nmea2000_id,
@@ -40,6 +33,10 @@ ADDRESS_CLAIM_INTERVAL_MS = 30_000
 HEARTBEAT_INTERVAL_MS = 1_000
 RECEIVE_POLL_INTERVAL_MS = 50
 FEEDBACK_LATCH_TIMEOUT_MS = 200
+DEFAULT_CAN_INTERFACE = "can0"
+CAN_EFF_FLAG = 0x80000000
+CAN_EFF_MASK = 0x1FFFFFFF
+
 
 
 def _ascii_field(value: str, length: int = 32) -> bytes:
@@ -95,6 +92,52 @@ def source_from_nmea2000_id(frame_id: int) -> int:
     return frame_id & 0xFF
 
 
+class SocketCANDevice:
+    """Small SocketCAN transport with the same send/receive shape used by the app."""
+
+    _CAN_FRAME = struct.Struct("=IB3x8s")
+
+    def __init__(self, interface_name: str = DEFAULT_CAN_INTERFACE) -> None:
+        self.interface_name = interface_name
+        self.socket: socket.socket | None = None
+
+    def open(self) -> None:
+        can_socket = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        can_socket.bind((self.interface_name,))
+        can_socket.setblocking(False)
+        self.socket = can_socket
+
+    def close(self) -> None:
+        if self.socket is not None:
+            self.socket.close()
+            self.socket = None
+
+    def send(self, frame_id: int, data: bytes) -> None:
+        if self.socket is None:
+            raise RuntimeError("SocketCAN device is not open.")
+        payload = bytes(data[:8])
+        can_id = (frame_id & CAN_EFF_MASK) | CAN_EFF_FLAG
+        frame = self._CAN_FRAME.pack(can_id, len(payload), payload.ljust(8, b"\x00"))
+        self.socket.send(frame)
+
+    def receive(self, max_frames: int = 50, wait_time_ms: int = 0) -> list[tuple[int, bytes]]:
+        if self.socket is None:
+            return []
+        timeout = max(0, wait_time_ms) / 1000
+        frames: list[tuple[int, bytes]] = []
+        while len(frames) < max_frames:
+            readable, _, _ = select.select([self.socket], [], [], timeout if not frames else 0)
+            if not readable:
+                break
+            try:
+                packet = self.socket.recv(self._CAN_FRAME.size)
+            except BlockingIOError:
+                break
+            can_id, data_length, data = self._CAN_FRAME.unpack(packet)
+            frames.append((can_id & CAN_EFF_MASK, data[:data_length]))
+        return frames
+
+
 def decode_binary_switch_bank_status(data: bytes, switch_count: int = SWITCH_COUNT) -> tuple[int, list[int]] | None:
     if len(data) < 8:
         return None
@@ -111,7 +154,7 @@ class BinarySwitchSimulatorApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Azimut NMEA2000 Switch Simulator")
-        self.device: USBCANDevice | None = None
+        self.device: SocketCANDevice | None = None
         self.receive_job: str | None = None
         self.address_claim_job: str | None = None
         self.heartbeat_job: str | None = None
@@ -264,26 +307,11 @@ class BinarySwitchSimulatorApp:
         self.pending_switch_targets[switch_index] = None
         self._refresh_switch_button_labels()
 
-    def resolve_dll_path(self) -> str:
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_DLL_NAME)
-
     def connect(self) -> None:
         if self.is_connected:
             return
-        if platform.system() != "Windows":
-            self.status_text.set("")
-            messagebox.showerror("Unsupported OS", "This simulator requires Windows because it loads ECanVci.dll.")
-            return
         try:
-            config = DeviceConfig(
-                dll_path=self.resolve_dll_path(),
-                device_type=DEFAULT_DEVICE_TYPE,
-                device_index=DEFAULT_DEVICE_INDEX,
-                can_index=DEFAULT_CAN_INDEX,
-                timing0=TIMING0_250K,
-                timing1=TIMING1_250K,
-            )
-            self.device = USBCANDevice(config)
+            self.device = SocketCANDevice(DEFAULT_CAN_INTERFACE)
             self.device.open()
             self.is_connected = True
             self.status_text.set("")
@@ -297,7 +325,7 @@ class BinarySwitchSimulatorApp:
             self.device = None
             self.is_connected = False
             self.status_text.set("")
-            messagebox.showerror("Connection error", str(exc))
+            messagebox.showerror("Connection error", f"Could not open SocketCAN interface {DEFAULT_CAN_INTERFACE}: {exc}")
 
     def disconnect(self) -> None:
         self._stop_receive()
