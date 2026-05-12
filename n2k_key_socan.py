@@ -18,7 +18,7 @@ PGN_BINARY_SWITCH_BANK_STATUS = 127501
 
 SWITCH_COUNT = 6
 PGN_BINARY_SWITCH_BANK_CONTROL = 127502
-DEFAULT_SWITCH_SOURCE_ADDRESS = 55
+DEFAULT_SWITCH_SOURCE_ADDRESS = 88
 DEFAULT_SWITCH_BANK_INSTANCE = 1
 DEFAULT_SWITCH_UNIQUE_NUMBER = 123456
 DEFAULT_SWITCH_DEVICE_INSTANCE_LOWER = 2
@@ -34,10 +34,6 @@ DEFAULT_NMEA2000_VERSION = 2100
 DEFAULT_MODEL_VERSION = "SW1"
 DEFAULT_PRODUCT_CODE = 1
 DEFAULT_PRODUCT_ID = "AZ_SW"
-ADDRESS_CLAIM_INTERVAL_MS = 60_000
-PRODUCT_INFO_INTERVAL_MS = 60_000
-IDENTITY_STARTUP_REPEAT_COUNT = 3
-IDENTITY_STARTUP_REPEAT_INTERVAL_MS = 100
 HEARTBEAT_INTERVAL_MS = 1_000
 RECEIVE_POLL_INTERVAL_MS = 50
 FEEDBACK_LATCH_TIMEOUT_MS = 200
@@ -280,8 +276,6 @@ class BinarySwitchSimulatorApp:
         self.root.bind("<Escape>", self._exit_fullscreen)
         self.device: SocketCANDevice | None = None
         self.receive_job: str | None = None
-        self.address_claim_job: str | None = None
-        self.product_info_job: str | None = None
         self.heartbeat_job: str | None = None
         self.is_connected = False
         self.fast_packet_sequence = 0
@@ -454,9 +448,7 @@ class BinarySwitchSimulatorApp:
             self.is_connected = True
             self.status_text.set("")
             self._schedule_receive()
-            self._send_startup_identity_burst()
-            self._schedule_address_claim()
-            self._schedule_product_info()
+            self._announce_startup_identity()
             self._schedule_heartbeat()
         except Exception as exc:
             self.device = None
@@ -469,8 +461,6 @@ class BinarySwitchSimulatorApp:
 
     def disconnect(self) -> None:
         self._stop_receive()
-        self._stop_address_claim()
-        self._stop_product_info()
         self._stop_heartbeat()
         self._clear_all_pending_feedback()
         if self.device:
@@ -482,15 +472,12 @@ class BinarySwitchSimulatorApp:
         self.is_connected = False
         self.status_text.set("")
 
-    def _send_startup_identity_burst(self) -> None:
-        for index in range(IDENTITY_STARTUP_REPEAT_COUNT):
-            self.root.after(index * IDENTITY_STARTUP_REPEAT_INTERVAL_MS, self._announce_identity)
-
-    def _announce_identity(self) -> None:
+    def _announce_startup_identity(self) -> None:
         if not self.device or not self.is_connected:
             return
+        # Standard NMEA 2000 startup behavior: claim this source address and start heartbeat.
+        # Product Information is sent when another node requests PGN 126996 via ISO Request.
         self._send_address_claim()
-        self._send_product_info()
         self._send_heartbeat()
 
     def _send_address_claim(self) -> None:
@@ -516,35 +503,6 @@ class BinarySwitchSimulatorApp:
         for frame in frames:
             self.device.send(frame_id, frame.ljust(8, b"\xFF"))
 
-    def _schedule_product_info(self) -> None:
-        if self.product_info_job is None:
-            self.product_info_job = self.root.after(PRODUCT_INFO_INTERVAL_MS, self._send_product_info_and_reschedule)
-
-    def _send_product_info_and_reschedule(self) -> None:
-        self.product_info_job = None
-        if self.device and self.is_connected:
-            self._send_product_info()
-            self._schedule_product_info()
-
-    def _stop_product_info(self) -> None:
-        if self.product_info_job is not None:
-            self.root.after_cancel(self.product_info_job)
-            self.product_info_job = None
-
-    def _schedule_address_claim(self) -> None:
-        if self.address_claim_job is None:
-            self.address_claim_job = self.root.after(ADDRESS_CLAIM_INTERVAL_MS, self._send_address_claim_and_reschedule)
-
-    def _send_address_claim_and_reschedule(self) -> None:
-        self.address_claim_job = None
-        if self.device and self.is_connected:
-            self._send_address_claim()
-            self._schedule_address_claim()
-
-    def _stop_address_claim(self) -> None:
-        if self.address_claim_job is not None:
-            self.root.after_cancel(self.address_claim_job)
-            self.address_claim_job = None
 
     def _send_heartbeat(self) -> None:
         if not self.device:
