@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 GLOBAL_DESTINATION = 0xFF
+PGN_ISO_REQUEST = 59904
 PGN_ADDRESS_CLAIM = 60928
 PGN_HEARTBEAT = 126993
 PGN_PRODUCT_INFO = 126996
@@ -23,7 +24,7 @@ DEFAULT_SWITCH_DEVICE_NAME = 0x1F2000AA12345678
 DEFAULT_MANUFACTURER_CODE = 176
 DEFAULT_PRODUCT_NAME = "Azimut Switch"
 DEFAULT_APPLICATION_VERSION = "0.1"
-DEFAULT_DATABASE_VERSION = 2000
+DEFAULT_NMEA2000_VERSION = 2100
 DEFAULT_MODEL_VERSION = "SW1"
 DEFAULT_PRODUCT_CODE = 1
 DEFAULT_PRODUCT_ID = "AZ_SW"
@@ -43,8 +44,10 @@ def build_address_claim(device_name: int) -> bytes:
 
 
 def build_heartbeat_payload(interval_ms: int, sequence: int) -> bytes:
-    interval = max(0, min(0xFFFF, int(interval_ms)))
-    return bytes((sequence & 0xFF,)) + interval.to_bytes(2, byteorder="little", signed=False) + bytes((0xFF,) * 5)
+    # PGN 126993 Heartbeat: two-byte transmission interval in 0.01 second units,
+    # sequence counter, then controller/equipment state bits left unavailable.
+    interval = max(0, min(0xFFFF, int(round(interval_ms / 10))))
+    return interval.to_bytes(2, byteorder="little", signed=False) + bytes((sequence & 0xFF,)) + bytes((0xFF,) * 5)
 
 
 def nmea2000_id(priority: int, pgn: int, source: int, destination: int = GLOBAL_DESTINATION) -> int:
@@ -52,8 +55,10 @@ def nmea2000_id(priority: int, pgn: int, source: int, destination: int = GLOBAL_
     source_bits = source & 0xFF
     pf = (pgn >> 8) & 0xFF
     if pf < 240:
-        return priority_bits | ((pgn & 0x1FF00) << 8) | ((destination & 0xFF) << 8) | source_bits
-    return priority_bits | ((pgn & 0x1FFFF) << 8) | source_bits
+        # PDU1 PGNs use the PS byte as destination, with the PGN low byte cleared.
+        return priority_bits | ((pgn & 0x3FF00) << 8) | ((destination & 0xFF) << 8) | source_bits
+    # PDU2 PGNs include the group extension in the PGN and are always broadcast.
+    return priority_bits | ((pgn & 0x3FFFF) << 8) | source_bits
 
 
 def set_name_manufacturer_code(device_name: int, manufacturer_code: int) -> int:
@@ -82,22 +87,23 @@ def _ascii_field(value: str, length: int = 32) -> bytes:
 def build_switch_product_info_payload(
     product_name: str,
     application_version: str,
-    database_version: int,
+    nmea2000_version: int,
     model_version: str,
     product_code: int,
     product_id: str,
 ) -> bytes:
-    # PGN 126996 Product Information layout. Keep these fields in the secondary
-    # settings menu so the main switch panel stays compact.
-    database = int(max(0, min(0xFFFF, database_version))).to_bytes(2, byteorder="little", signed=False)
+    # PGN 126996 Product Information layout:
+    # NMEA 2000 version, product code, model ID, software version,
+    # model version, model serial code, certification level, load equivalency.
+    n2k_version = int(max(0, min(0xFFFF, nmea2000_version))).to_bytes(2, byteorder="little", signed=False)
     product_code_bytes = int(max(0, min(0xFFFF, product_code))).to_bytes(2, byteorder="little", signed=False)
     return (
-        database
+        n2k_version
         + product_code_bytes
-        + _ascii_field(product_id)
+        + _ascii_field(product_name)
         + _ascii_field(application_version)
         + _ascii_field(model_version)
-        + _ascii_field(product_name)
+        + _ascii_field(product_id)
         + bytes((1, 1))
     )
 
@@ -126,6 +132,19 @@ def pgn_from_nmea2000_id(frame_id: int) -> int:
 
 def source_from_nmea2000_id(frame_id: int) -> int:
     return frame_id & 0xFF
+
+
+def destination_from_nmea2000_id(frame_id: int) -> int:
+    pf = (frame_id >> 16) & 0xFF
+    if pf < 240:
+        return (frame_id >> 8) & 0xFF
+    return GLOBAL_DESTINATION
+
+
+def requested_pgn_from_iso_request(data: bytes) -> int | None:
+    if len(data) < 3:
+        return None
+    return data[0] | (data[1] << 8) | (data[2] << 16)
 
 
 class SocketCANDevice:
@@ -242,7 +261,7 @@ class BinarySwitchSimulatorApp:
         self.manufacturer_code = tk.StringVar(value=str(DEFAULT_MANUFACTURER_CODE))
         self.product_name = tk.StringVar(value=DEFAULT_PRODUCT_NAME)
         self.application_version = tk.StringVar(value=DEFAULT_APPLICATION_VERSION)
-        self.database_version = tk.StringVar(value=str(DEFAULT_DATABASE_VERSION))
+        self.nmea2000_version = tk.StringVar(value=str(DEFAULT_NMEA2000_VERSION))
         self.model_version = tk.StringVar(value=DEFAULT_MODEL_VERSION)
         self.product_code = tk.StringVar(value=str(DEFAULT_PRODUCT_CODE))
         self.product_id = tk.StringVar(value=DEFAULT_PRODUCT_ID)
@@ -313,7 +332,7 @@ class BinarySwitchSimulatorApp:
         ttk.Separator(frame).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 6))
         self._add_setting_field(frame, 4, "Product name", self.product_name)
         self._add_setting_field(frame, 5, "Application version", self.application_version)
-        self._add_setting_field(frame, 6, "Database version", self.database_version)
+        self._add_setting_field(frame, 6, "NMEA 2000 version", self.nmea2000_version)
         self._add_setting_field(frame, 7, "Model version", self.model_version)
         self._add_setting_field(frame, 8, "Product code", self.product_code)
         self._add_setting_field(frame, 9, "Product ID", self.product_id)
@@ -440,7 +459,7 @@ class BinarySwitchSimulatorApp:
         payload = build_switch_product_info_payload(
             self.product_name.get(),
             self.application_version.get(),
-            self._as_int(self.database_version.get(), DEFAULT_DATABASE_VERSION),
+            self._as_int(self.nmea2000_version.get(), DEFAULT_NMEA2000_VERSION),
             self.model_version.get(),
             self._as_int(self.product_code.get(), DEFAULT_PRODUCT_CODE),
             self.product_id.get(),
@@ -520,12 +539,24 @@ class BinarySwitchSimulatorApp:
                 self._apply_binary_switch_status(data)
             elif pgn == PGN_ADDRESS_CLAIM:
                 self._handle_address_claim(frame_id, data)
+            elif pgn == PGN_ISO_REQUEST:
+                self._handle_iso_request(frame_id, data)
 
     def _handle_address_claim(self, frame_id: int, data: bytes) -> None:
         # Simplified address-conflict handling: if another node claims our source address,
         # re-send our address claim so the bus sees this simulated node's NAME again.
         if source_from_nmea2000_id(frame_id) == self._source_address() and data != build_address_claim(self._device_name()):
             self._send_address_claim()
+
+    def _handle_iso_request(self, frame_id: int, data: bytes) -> None:
+        destination = destination_from_nmea2000_id(frame_id)
+        if destination not in (GLOBAL_DESTINATION, self._source_address()):
+            return
+        requested_pgn = requested_pgn_from_iso_request(data)
+        if requested_pgn == PGN_ADDRESS_CLAIM:
+            self._send_address_claim()
+        elif requested_pgn == PGN_PRODUCT_INFO:
+            self._send_product_info()
 
     def _apply_binary_switch_status(self, data: bytes) -> None:
         decoded = decode_binary_switch_bank_status(data, SWITCH_COUNT)
